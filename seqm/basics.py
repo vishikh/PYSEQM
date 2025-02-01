@@ -10,6 +10,7 @@ from .seqm_functions.rcis import rcis
 from .seqm_functions.rcis_grad import rcis_grad
 from .seqm_functions.rcis_batch import rcis_batch
 from .seqm_functions.rcis_grad_batch import rcis_grad_batch
+from .seqm_functions.dispersion_am1_fs import dispersion_am1_fs1
 
 import os
 import time
@@ -430,6 +431,7 @@ class Energy(torch.nn.Module):
         self.uhf = seqm_parameters.get('UHF', False)
         self.eig = seqm_parameters.get('eig', False)
         self.excited_states = seqm_parameters.get('excited_states', [False])
+        self.dispersion_correction = seqm_parameters.get('dispersion_correction', False)
 
     def forward(self, molecule, learned_parameters=dict(), all_terms=False, P0=None, *args, **kwargs):
         """
@@ -635,6 +637,13 @@ class Energy(torch.nn.Module):
                 else: # to be decomissioned
                     excitation_energies, exc_amps = rcis(molecule,w,e,self.excited_states[1])
                     rcis_grad(molecule,exc_amps[0],w,e,riXH,ri,P)
+
+        if self.dispersion_correction:
+            # add dispersion corrections
+            if self.method != 'AM1':
+                raise ValueError('Dispersion correction has been implement only for AM1 method (AM1-FS1). We cannot do dispersion correction for other methods')
+            print("Adding in dispersion corrected AM1-FS1 to Electronic energy")
+            Eelec += dispersion_am1_fs1(molecule)
 
         if all_terms:
             Etot, Enuc = total_energy(molecule.nmol, molecule.pair_molid,EnucAB, Eelec)
