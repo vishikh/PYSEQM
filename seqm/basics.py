@@ -10,6 +10,8 @@ from .seqm_functions.rcis import rcis
 from .seqm_functions.rcis_grad import rcis_grad
 from .seqm_functions.rcis_batch import rcis_batch
 from .seqm_functions.rcis_grad_batch import rcis_grad_batch
+from torch.profiler import profile, record_function, ProfilerActivity
+
 
 import os
 import time
@@ -629,7 +631,17 @@ class Energy(torch.nn.Module):
                 if molecule.nmol >= 1:
                     if molecule.const.do_timing: t0 = time.time()
 
-                    excitation_energies, exc_amps = rcis_batch(molecule,w,e,self.excited_states[1],cis_tol)
+                    with profile(
+                            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                            on_trace_ready=torch.profiler.tensorboard_trace_handler('./log'),
+                            record_shapes=True,
+                            profile_memory=True,
+                            with_stack=True,
+                            ) as prof:
+                            excitation_energies, exc_amps = rcis_batch(molecule,w,e,self.excited_states[1],cis_tol)
+                            prof.step()
+                            
+                            print(prof.key_averages().table(sort_by="self_cuda_time_total",row_limit=20))
 
                     if molecule.const.do_timing:
                         if torch.cuda.is_available(): torch.cuda.synchronize()

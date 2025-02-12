@@ -1,6 +1,7 @@
 import torch
 from seqm.seqm_functions.pack import packone, unpackone
 import warnings
+import torch.profiler as profiler
 
 def print_memory_usage(step_description, device=0):
     allocated = torch.cuda.memory_allocated(device) / 1024**2  # Convert to MB
@@ -75,7 +76,7 @@ def rcis_batch(mol, w, e_mo, nroots, root_tol):
     #     V[i,sortedidx[i,:nstart],z] = 1.0
     V[torch.arange(nmol).unsqueeze(1),torch.arange(nstart),sortedidx[:,:nstart]] = 1.0
 
-    max_iter = 80 # 5*maxSubspacesize//nroots # Heuristic: allow one or two subspace collapse. TODO: User-defined
+    max_iter = 100 # 5*maxSubspacesize//nroots # Heuristic: allow one or two subspace collapse. TODO: User-defined
     vector_tol = root_tol*0.02 # Vectors whose norm is smaller than this will be discarded
     iter = 0
     vstart = torch.zeros(nmol,dtype=torch.int,device=device)
@@ -95,11 +96,12 @@ def rcis_batch(mol, w, e_mo, nroots, root_tol):
     # print_memory_usage("Before davidson loop start")
     while iter <= max_iter: # Davidson loop
 
-        max_v = torch.max(vend-vstart).item()
-        V_batched = torch.zeros(nmol,max_v,nov,dtype=dtype,device=device)
-        for i in range(nmol):
-            if not done[i]:
-                V_batched[i,: (vend[i]-vstart[i]),:] = V[i,vstart[i]:vend[i],:]
+        with profiler.record_function("make vectors V_batched"):
+            max_v = torch.max(vend-vstart).item()
+            V_batched = torch.zeros(nmol,max_v,nov,dtype=dtype,device=device)
+            for i in range(nmol):
+                if not done[i]:
+                    V_batched[i,: (vend[i]-vstart[i]),:] = V[i,vstart[i]:vend[i],:]
 
         # TODO: Think about how HV is going to be built
         HV_batch = matrix_vector_product_batched(mol,V_batched, w, ea_ei, Cocc, Cvirt)
@@ -111,7 +113,8 @@ def rcis_batch(mol, w, e_mo, nroots, root_tol):
         # Make H by multiplying V.T * HV
         # Option 1: direct multiplication
         vend_max = torch.max(vend).item()
-        H = torch.einsum('bnia,bria->bnr',V[:,:vend_max].view(nmol,vend_max,nocc,nvirt),HV[:,:vend_max].view(nmol,vend_max,nocc,nvirt))
+        with profiler.record_function("H = VT*HV"):
+            H = torch.einsum('bnia,bria->bnr',V[:,:vend_max].view(nmol,vend_max,nocc,nvirt),HV[:,:vend_max].view(nmol,vend_max,nocc,nvirt))
 
         # Option 2: avoid redundant multipication by only forming the new blocks of H coming from the guess vectors V[vstart:vend]
         # H = torch.empty(vend,vend,device=device,dtype=dtype)
@@ -131,14 +134,16 @@ def rcis_batch(mol, w, e_mo, nroots, root_tol):
 
         # Diagonalize the subspace hamiltonian
         zero_pad = vend_max - vend
-        e_vec_n =  get_subspace_eig_batched(H,nroots,zero_pad,e_val_n,done,nonorthogonal)
 
+        with profiler.record_function("Diagonalize H"):
+            e_vec_n =  get_subspace_eig_batched(H,nroots,zero_pad,e_val_n,done,nonorthogonal)
 
-        amplitudes = torch.einsum('bvr,bvo->bro',e_vec_n,V[:,:vend_max,:])
-        residual = torch.einsum('bvr,bvo->bro',e_vec_n, HV[:,:vend_max,:]) - amplitudes*e_val_n.unsqueeze(2)
+        with profiler.record_function("Make residual"):
+            amplitudes = torch.einsum('bvr,bvo->bro',e_vec_n,V[:,:vend_max,:])
+            residual = torch.einsum('bvr,bvo->bro',e_vec_n, HV[:,:vend_max,:]) - amplitudes*e_val_n.unsqueeze(2)
 
-        resid_norm = torch.norm(residual,dim=2)
-        roots_not_converged = resid_norm > root_tol
+            resid_norm = torch.norm(residual,dim=2)
+            roots_not_converged = resid_norm > root_tol
 
         for i in range(nmol):
             if done[i]:
@@ -169,7 +174,9 @@ def rcis_batch(mol, w, e_mo, nroots, root_tol):
                 V[vstart:vend] = newsubspace[nonzero_newsubspace]/newsubspace_norm[nonzero_newsubspace].unsqueeze(1)
 
             else:
-                vend[i] = orthogonalize_to_current_subspace(V[i], newsubspace, vend[i], vector_tol)
+
+                with profiler.record_function("Orthogonalize subspace"):
+                    vend[i] = orthogonalize_to_current_subspace(V[i], newsubspace, vend[i], vector_tol)
 
             roots_left = vend[i] - vstart[i]
             if roots_left==0:
@@ -193,23 +200,24 @@ def rcis_batch(mol, w, e_mo, nroots, root_tol):
 
 
 def matrix_vector_product_batched(mol, V, w, ea_ei, Cocc, Cvirt):
-    # C: Molecule Orbital Coefficients
-    nmol, nvec, nov = V.shape
+    with profiler.record_function("mat_vec_product"):
+        # C: Molecule Orbital Coefficients
+        nmol, nvec, nov = V.shape
 
-    norb = mol.norb[0]
-    nocc = mol.nocc[0]
-    nvirt = norb - nocc
+        norb = mol.norb[0]
+        nocc = mol.nocc[0]
+        nvirt = norb - nocc
 
 
-    Via = V.view(nmol,nvec, nocc, nvirt)
-    P_xi = torch.einsum('bmi,bria,bna->brmn', Cocc,Via, Cvirt)
+        Via = V.view(nmol,nvec, nocc, nvirt)
+        P_xi = torch.einsum('bmi,bria,bna->brmn', Cocc,Via, Cvirt)
 
-    F0 = makeA_pi_batched(mol,P_xi,w)
+        F0 = makeA_pi_batched(mol,P_xi,w)
 
-    # TODO: why am I multiplying by 2?
-    A = torch.einsum('bmi,brmn,bna->bria', Cocc, F0, Cvirt)*2.0
+        # TODO: why am I multiplying by 2?
+        A = torch.einsum('bmi,brmn,bna->bria', Cocc, F0, Cvirt)*2.0
 
-    A += Via*ea_ei.unsqueeze(1)
+        A += Via*ea_ei.unsqueeze(1)
 
     return A.view(nmol, nvec, -1)
 
@@ -219,37 +227,155 @@ def makeA_pi_batched(mol,P_xi,w_,allSymmetric=False):
     calculates the contraction with two-electron integrals
     In other words for an amplitued X_jb, this function calculates \sum_jb (\mu\nu||jb)X_jb
     """
-    device = P_xi.device
-    dtype = P_xi.dtype
+    with profiler.record_function("makeA_pi"):
+        device = P_xi.device
+        dtype = P_xi.dtype
 
-    npairs_per_mol = (mol.molsize*(mol.molsize-1)) // 2
-    nmol  = mol.nmol
-    mask  = mol.mask[:npairs_per_mol]
-    maskd = mol.maskd[:mol.molsize]
-    mask_l = mol.mask_l[:npairs_per_mol]
-    molsize = mol.molsize
-    nHeavy = mol.nHeavy[0]
-    nHydro = mol.nHydro[0]
-    norb = mol.norb[0]
+        npairs_per_mol = (mol.molsize*(mol.molsize-1)) // 2
+        nmol  = mol.nmol
+        mask  = mol.mask[:npairs_per_mol]
+        maskd = mol.maskd[:mol.molsize]
+        mask_l = mol.mask_l[:npairs_per_mol]
+        molsize = mol.molsize
+        nHeavy = mol.nHeavy[0]
+        nHydro = mol.nHydro[0]
+        norb = mol.norb[0]
 
-    nnewRoots = P_xi.shape[1]
-    P0 = torch.stack([
-        unpackone(P_xi[i,j], 4*nHeavy, nHydro, molsize * 4)
-        for i in range(nmol) for j in range(nnewRoots)
-    ]).view(nmol,nnewRoots, molsize * 4, molsize * 4)
-    # print_memory_usage("After unpacking P_xi")
+        nnewRoots = P_xi.shape[1]
+        P0 = torch.stack([
+            unpackone(P_xi[i,j], 4*nHeavy, nHydro, molsize * 4)
+            for i in range(nmol) for j in range(nnewRoots)
+        ]).view(nmol,nnewRoots, molsize * 4, molsize * 4)
+        # print_memory_usage("After unpacking P_xi")
 
-    w = w_.view(nmol,npairs_per_mol,10,10)
-    # Compute the (ai||jb)X_jb
-    F = makeA_pi_symm_batch(mol,P0,w)
-    # print_memory_usage("After makeA_pi_symm")
+        w = w_.view(nmol,npairs_per_mol,10,10)
+        # Compute the (ai||jb)X_jb
+        F = makeA_pi_symm_batch(mol,P0,w)
+        # print_memory_usage("After makeA_pi_symm")
 
-    if not allSymmetric:
+        if not allSymmetric:
 
-        P0_antisym = 0.5*(P0 - P0.transpose(2,3))
-        P_anti = P0_antisym.reshape(nmol,nnewRoots,molsize,4,molsize,4)\
+            P0_antisym = 0.5*(P0 - P0.transpose(2,3))
+            P_anti = P0_antisym.reshape(nmol,nnewRoots,molsize,4,molsize,4)\
+                      .transpose(3,4).reshape(nmol,nnewRoots,molsize*molsize,4,4)
+            del P0_antisym
+
+            # (ss ), (px s), (px px), (py s), (py px), (py py), (pz s), (pz px), (pz py), (pz pz)
+            #   0,     1         2       3       4         5       6      7         8        9
+            ind = torch.tensor([[0,1,3,6],
+                                [1,2,4,7],
+                                [3,4,5,8],
+                                [6,7,8,9]],dtype=torch.int64, device=device)
+            sumK = torch.empty(nmol,nnewRoots, w.shape[1], 4, 4, dtype=dtype, device=device)
+            Pp = -0.5 * P_anti[:, :, mask]
+            for i in range(4):
+                for j in range(4):
+                    #\sum_{nu \in A} \sum_{sigma \in B} P_{nu, sigma} * (mu nu, lambda, sigma)
+                    sumK[...,i,j] = torch.sum(Pp*w[...,ind[i],:][...,:,ind[j]].unsqueeze(1),dim=(3,4))
+            F.index_add_(2,mask,sumK)
+            F[:,:,mask_l] -= sumK.transpose(3,4)
+            del Pp
+            del sumK
+
+            gsp = mol.parameters['g_sp'].view(nmol,-1)
+            gpp = mol.parameters['g_pp'].view(nmol,-1)
+            gp2 = mol.parameters['g_p2'].view(nmol,-1)
+            hsp = mol.parameters['h_sp'].view(nmol,-1)
+
+            F2e1c = torch.zeros(nmol,nnewRoots,maskd.shape[0],4,4,device=device,dtype=dtype)
+            for i in range(1,4):
+                #(s,p) = (p,s) upper triangle
+                F2e1c[...,0,i] = P_anti[...,maskd,0,i]*(0.5*hsp - 0.5*gsp).unsqueeze(1)
+            #(p,p*)
+            for i,j in [(1,2),(1,3),(2,3)]:
+                F2e1c[...,i,j] = P_anti[...,maskd,i,j]* (0.25*gpp - 0.75*gp2).unsqueeze(1)
+
+            F2e1c.add_(F2e1c.triu(1).transpose(3,4),alpha=-1.0)
+            F[:,:,maskd] += F2e1c
+            del P_anti
+            del F2e1c
+
+        F0 = F.reshape(nmol,nnewRoots,molsize,molsize,4,4) \
+                 .transpose(3,4) \
+                 .reshape(nmol,nnewRoots, 4*molsize, 4*molsize)
+        del F
+
+        F0 = torch.stack([
+            packone(F0[i,j], 4*nHeavy, nHydro, norb)
+            for i in range(nmol) for j in range(nnewRoots)
+        ])
+
+        return F0.view(nmol,nnewRoots,norb,norb)
+
+def makeA_pi_symm_batch(mol,P0,w):
+
+    with profiler.record_function("makeA_pi_symm"):
+        P0_sym = 0.5*(P0 + P0.transpose(2,3))
+
+        molsize = mol.molsize
+        nnewRoots = P0.shape[1]
+        dtype = P0.dtype
+        device = P0.device
+
+        npairs_per_mol = (mol.molsize*(mol.molsize-1)) // 2
+        mask  = mol.mask[:npairs_per_mol]
+        maskd = mol.maskd[:mol.molsize]
+        mask_l = mol.mask_l[:npairs_per_mol]
+        idxi  = mol.idxi[:npairs_per_mol]
+        idxj  = mol.idxj[:npairs_per_mol]
+        nmol = mol.nmol
+
+        P = P0_sym.reshape(nmol,nnewRoots,molsize,4,molsize,4)\
                   .transpose(3,4).reshape(nmol,nnewRoots,molsize*molsize,4,4)
-        del P0_antisym
+        del P0_sym
+        F = torch.zeros_like(P)
+        # print_memory_usage("After P_symm, and Fock_symm")
+
+        # Two center-two elecron integrals
+        weight = torch.tensor([1.0,
+                               2.0, 1.0,
+                               2.0, 2.0, 1.0,
+                               2.0, 2.0, 2.0, 1.0],dtype=dtype, device=device).reshape((-1,10))
+
+        #0.030472556808550877, Pdiag_symmetrized = P[:,maskd]+P[:,maskd].transpose(2,3)
+        # weight *= 0.5 # dividing by 2 because I didn't do it while making the symmetrized P matrix
+        Pdiag_symmetrized = P[:,:,maskd]
+
+        PA = (Pdiag_symmetrized[:,:,idxi][...,(0,0,1,0,1,2,0,1,2,3),(0,1,1,2,2,2,3,3,3,3)]*weight).unsqueeze(-1)
+        PB = (Pdiag_symmetrized[:,:,idxj][...,(0,0,1,0,1,2,0,1,2,3),(0,1,1,2,2,2,3,3,3,3)]*weight).unsqueeze(-2)
+        del Pdiag_symmetrized
+
+        #suma \sum_{mu,nu \in A} P_{mu, nu in A} (mu nu, lamda sigma) = suma_{lambda sigma \in B}
+        #suma shape (npairs, 10)
+        suma = torch.sum(PA*w.unsqueeze(1),dim=3)
+        #sumb \sum_{l,s \in B} P_{l, s inB} (mu nu, l s) = sumb_{mu nu \in A}
+        #sumb shape (npairs, 10)
+        sumb = torch.sum(PB*w.unsqueeze(1),dim=4)
+        #reshape back to (npairs 4,4)
+        # as will use index add in the following part
+        sumA = torch.zeros(nmol,nnewRoots,w.shape[1],4,4,dtype=dtype, device=device)
+        sumB = torch.zeros_like(sumA)
+        sumA[...,(0,0,1,0,1,2,0,1,2,3),(0,1,1,2,2,2,3,3,3,3)] = suma
+        sumB[...,(0,0,1,0,1,2,0,1,2,3),(0,1,1,2,2,2,3,3,3,3)] = sumb
+        # sumA.add_(sumA.triu(1).transpose(3,4))
+        # sumB.add_(sumB.triu(1).transpose(3,4))
+        #F^A_{mu, nu} = Hcore + \sum^A + \sum_{B} \sum_{l, s \in B} P_{l,s \in B} * (mu nu, l s)
+        #\sum_B
+        F.index_add_(2,maskd[idxi],sumB)
+        #\sum_A
+        F.index_add_(2,maskd[idxj],sumA)
+
+        del PA
+        del PB
+        del sumA
+        # del sumB
+
+        # off diagonal block part, check KAB in forck2.f
+        # mu, nu in A
+        # lambda, sigma in B
+        # F_mu_lambda = Hcore - 0.5* \sum_{nu \in A} \sum_{sigma in B} P_{nu, sigma} * (mu nu, lambda, sigma)
+
+        sumK = sumB
 
         # (ss ), (px s), (px px), (py s), (py px), (py py), (pz s), (pz px), (pz py), (pz pz)
         #   0,     1         2       3       4         5       6      7         8        9
@@ -257,161 +383,45 @@ def makeA_pi_batched(mol,P_xi,w_,allSymmetric=False):
                             [1,2,4,7],
                             [3,4,5,8],
                             [6,7,8,9]],dtype=torch.int64, device=device)
-        sumK = torch.empty(nmol,nnewRoots, w.shape[1], 4, 4, dtype=dtype, device=device)
-        Pp = -0.5 * P_anti[:, :, mask]
+        # Pp =P[mask], P_{mu \in A, lambda \in B}
+        Pp = -0.5*P[:,:,mask]
         for i in range(4):
             for j in range(4):
                 #\sum_{nu \in A} \sum_{sigma \in B} P_{nu, sigma} * (mu nu, lambda, sigma)
                 sumK[...,i,j] = torch.sum(Pp*w[...,ind[i],:][...,:,ind[j]].unsqueeze(1),dim=(3,4))
         F.index_add_(2,mask,sumK)
-        F[:,:,mask_l] -= sumK.transpose(3,4)
+        F[:,:,mask_l] += sumK.transpose(3,4)
         del Pp
-        del sumK
 
+        Pptot = P[...,1,1]+P[...,2,2]+P[...,3,3]
+
+        # One center-two electron integrals
+        gss = mol.parameters['g_ss'].view(nmol,-1)
         gsp = mol.parameters['g_sp'].view(nmol,-1)
         gpp = mol.parameters['g_pp'].view(nmol,-1)
         gp2 = mol.parameters['g_p2'].view(nmol,-1)
         hsp = mol.parameters['h_sp'].view(nmol,-1)
 
         F2e1c = torch.zeros(nmol,nnewRoots,maskd.shape[0],4,4,device=device,dtype=dtype)
+
+        F2e1c[...,0,0] = 0.5*P[...,maskd,0,0]*gss.unsqueeze(1) + Pptot[...,maskd]*(gsp-0.5*hsp).unsqueeze(1)
         for i in range(1,4):
+            #(p,p)
+            F2e1c[...,i,i] = P[...,maskd,0,0]*(gsp-0.5*hsp).unsqueeze(1) + 0.5*P[...,maskd,i,i]*gpp.unsqueeze(1) \
+                    + (Pptot[...,maskd] - P[...,maskd,i,i]) * (1.25*gp2-0.25*gpp).unsqueeze(1)
             #(s,p) = (p,s) upper triangle
-            F2e1c[...,0,i] = P_anti[...,maskd,0,i]*(0.5*hsp - 0.5*gsp).unsqueeze(1)
+            F2e1c[...,0,i] = P[...,maskd,0,i]*(1.5*hsp - 0.5*gsp).unsqueeze(1)
         #(p,p*)
         for i,j in [(1,2),(1,3),(2,3)]:
-            F2e1c[...,i,j] = P_anti[...,maskd,i,j]* (0.25*gpp - 0.75*gp2).unsqueeze(1)
+            F2e1c[...,i,j] = P[...,maskd,i,j]* (0.75*gpp - 1.25*gp2).unsqueeze(1)
 
-        F2e1c.add_(F2e1c.triu(1).transpose(3,4),alpha=-1.0)
-        F[:,:,maskd] += F2e1c
-        del P_anti
-        del F2e1c
-
-    F0 = F.reshape(nmol,nnewRoots,molsize,molsize,4,4) \
-             .transpose(3,4) \
-             .reshape(nmol,nnewRoots, 4*molsize, 4*molsize)
-    del F
-
-    F0 = torch.stack([
-        packone(F0[i,j], 4*nHeavy, nHydro, norb)
-        for i in range(nmol) for j in range(nnewRoots)
-    ])
-
-    return F0.view(nmol,nnewRoots,norb,norb)
-
-def makeA_pi_symm_batch(mol,P0,w):
-
-    P0_sym = 0.5*(P0 + P0.transpose(2,3))
-
-    molsize = mol.molsize
-    nnewRoots = P0.shape[1]
-    dtype = P0.dtype
-    device = P0.device
-
-    npairs_per_mol = (mol.molsize*(mol.molsize-1)) // 2
-    mask  = mol.mask[:npairs_per_mol]
-    maskd = mol.maskd[:mol.molsize]
-    mask_l = mol.mask_l[:npairs_per_mol]
-    idxi  = mol.idxi[:npairs_per_mol]
-    idxj  = mol.idxj[:npairs_per_mol]
-    nmol = mol.nmol
-
-    P = P0_sym.reshape(nmol,nnewRoots,molsize,4,molsize,4)\
-              .transpose(3,4).reshape(nmol,nnewRoots,molsize*molsize,4,4)
-    del P0_sym
-    F = torch.zeros_like(P)
-    # print_memory_usage("After P_symm, and Fock_symm")
-
-    # Two center-two elecron integrals
-    weight = torch.tensor([1.0,
-                           2.0, 1.0,
-                           2.0, 2.0, 1.0,
-                           2.0, 2.0, 2.0, 1.0],dtype=dtype, device=device).reshape((-1,10))
-
-    #0.030472556808550877, Pdiag_symmetrized = P[:,maskd]+P[:,maskd].transpose(2,3)
-    # weight *= 0.5 # dividing by 2 because I didn't do it while making the symmetrized P matrix
-    Pdiag_symmetrized = P[:,:,maskd]
-
-    PA = (Pdiag_symmetrized[:,:,idxi][...,(0,0,1,0,1,2,0,1,2,3),(0,1,1,2,2,2,3,3,3,3)]*weight).unsqueeze(-1)
-    PB = (Pdiag_symmetrized[:,:,idxj][...,(0,0,1,0,1,2,0,1,2,3),(0,1,1,2,2,2,3,3,3,3)]*weight).unsqueeze(-2)
-    del Pdiag_symmetrized
-
-    #suma \sum_{mu,nu \in A} P_{mu, nu in A} (mu nu, lamda sigma) = suma_{lambda sigma \in B}
-    #suma shape (npairs, 10)
-    suma = torch.sum(PA*w.unsqueeze(1),dim=3)
-    #sumb \sum_{l,s \in B} P_{l, s inB} (mu nu, l s) = sumb_{mu nu \in A}
-    #sumb shape (npairs, 10)
-    sumb = torch.sum(PB*w.unsqueeze(1),dim=4)
-    #reshape back to (npairs 4,4)
-    # as will use index add in the following part
-    sumA = torch.zeros(nmol,nnewRoots,w.shape[1],4,4,dtype=dtype, device=device)
-    sumB = torch.zeros_like(sumA)
-    sumA[...,(0,0,1,0,1,2,0,1,2,3),(0,1,1,2,2,2,3,3,3,3)] = suma
-    sumB[...,(0,0,1,0,1,2,0,1,2,3),(0,1,1,2,2,2,3,3,3,3)] = sumb
-    # sumA.add_(sumA.triu(1).transpose(3,4))
-    # sumB.add_(sumB.triu(1).transpose(3,4))
-    #F^A_{mu, nu} = Hcore + \sum^A + \sum_{B} \sum_{l, s \in B} P_{l,s \in B} * (mu nu, l s)
-    #\sum_B
-    F.index_add_(2,maskd[idxi],sumB)
-    #\sum_A
-    F.index_add_(2,maskd[idxj],sumA)
-
-    del PA
-    del PB
-    del sumA
-    # del sumB
-
-    # off diagonal block part, check KAB in forck2.f
-    # mu, nu in A
-    # lambda, sigma in B
-    # F_mu_lambda = Hcore - 0.5* \sum_{nu \in A} \sum_{sigma in B} P_{nu, sigma} * (mu nu, lambda, sigma)
-
-    sumK = sumB
-
-    # (ss ), (px s), (px px), (py s), (py px), (py py), (pz s), (pz px), (pz py), (pz pz)
-    #   0,     1         2       3       4         5       6      7         8        9
-    ind = torch.tensor([[0,1,3,6],
-                        [1,2,4,7],
-                        [3,4,5,8],
-                        [6,7,8,9]],dtype=torch.int64, device=device)
-    # Pp =P[mask], P_{mu \in A, lambda \in B}
-    Pp = -0.5*P[:,:,mask]
-    for i in range(4):
-        for j in range(4):
-            #\sum_{nu \in A} \sum_{sigma \in B} P_{nu, sigma} * (mu nu, lambda, sigma)
-            sumK[...,i,j] = torch.sum(Pp*w[...,ind[i],:][...,:,ind[j]].unsqueeze(1),dim=(3,4))
-    F.index_add_(2,mask,sumK)
-    F[:,:,mask_l] += sumK.transpose(3,4)
-    del Pp
-
-    Pptot = P[...,1,1]+P[...,2,2]+P[...,3,3]
-
-    # One center-two electron integrals
-    gss = mol.parameters['g_ss'].view(nmol,-1)
-    gsp = mol.parameters['g_sp'].view(nmol,-1)
-    gpp = mol.parameters['g_pp'].view(nmol,-1)
-    gp2 = mol.parameters['g_p2'].view(nmol,-1)
-    hsp = mol.parameters['h_sp'].view(nmol,-1)
-
-    F2e1c = torch.zeros(nmol,nnewRoots,maskd.shape[0],4,4,device=device,dtype=dtype)
-
-    F2e1c[...,0,0] = 0.5*P[...,maskd,0,0]*gss.unsqueeze(1) + Pptot[...,maskd]*(gsp-0.5*hsp).unsqueeze(1)
-    for i in range(1,4):
-        #(p,p)
-        F2e1c[...,i,i] = P[...,maskd,0,0]*(gsp-0.5*hsp).unsqueeze(1) + 0.5*P[...,maskd,i,i]*gpp.unsqueeze(1) \
-                + (Pptot[...,maskd] - P[...,maskd,i,i]) * (1.25*gp2-0.25*gpp).unsqueeze(1)
-        #(s,p) = (p,s) upper triangle
-        F2e1c[...,0,i] = P[...,maskd,0,i]*(1.5*hsp - 0.5*gsp).unsqueeze(1)
-    #(p,p*)
-    for i,j in [(1,2),(1,3),(2,3)]:
-        F2e1c[...,i,j] = P[...,maskd,i,j]* (0.75*gpp - 1.25*gp2).unsqueeze(1)
-
-    # F.add_(F2e1c)
-    # F2e1c.add_(F2e1c.triu(1).transpose(3,4))
-    F2e1c += F[:,:,maskd]
-    F2e1c.add_(F2e1c.triu(1).transpose(3,4))
-    F[:,:,maskd] = F2e1c
-    # F[:,:,maskd] += F2e1c
-    # F[:,:,maskd] += F[:,:,maskd].triu(1).transpose(3,4)
+        # F.add_(F2e1c)
+        # F2e1c.add_(F2e1c.triu(1).transpose(3,4))
+        F2e1c += F[:,:,maskd]
+        F2e1c.add_(F2e1c.triu(1).transpose(3,4))
+        F[:,:,maskd] = F2e1c
+        # F[:,:,maskd] += F2e1c
+        # F[:,:,maskd] += F[:,:,maskd].triu(1).transpose(3,4)
 
     return F
 
@@ -474,7 +484,7 @@ def getMaxSubspacesize(dtype,device,nov,nmol=1):
     num_matrices = 2  # Number of big matrices that will take up a big chunk of memory: V, HV
 
     # Define a memory fraction to use (e.g., 50% of available memory)
-    memory_fraction = 0.2
+    memory_fraction = 0.3
     usable_memory = available_memory * memory_fraction
 
     # Calculate maximum n based on memory
