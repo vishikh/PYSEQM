@@ -438,24 +438,25 @@ def orthogonalize_to_current_subspace(V, newsubspace, vend, tol):
     :returns: vend: size of the subspace after adding in the new vectors 
 
     """
+    # TODO: Do this in a batched mode. Right now I'm orthogonalizing one by one for each molecule in a batch
     for i in range(newsubspace.shape[0]):
         vec = newsubspace[i]
         # Instead of batch processing like below, it is more numerically stable to do it one by one in a loop
-        # projection = V[:vend] @ vec
-        # vec -= projection @ V[:vend]
-        for j in range(vend):
-            vec -= torch.dot(V[j], vec) * V[j]
+        c = torch.mv(V[:vend],vec) # Dot product of vec with each vector in V
+        vec -= torch.mv(V[:vend].t(),c) # Subtract the projection on each vector
+        # for j in range(vend):
+        #     vec -= torch.dot(V[j], vec) * V[j]
 
         vecnorm = torch.norm(vec)
 
         if vecnorm > tol:
-            vec /= vecnorm
-
-            # reorthogonalize because dividing by the norm can make it numerically non-orthogonal
-            # projection = V[:vend] @ vec
-            # vec -= projection @ V[:vend]
-            for j in range(vend):
-                vec -= torch.dot(V[j], vec) * V[j]
+            c = torch.mv(V[:vend],vec) # Dot product of vec with each vector in V
+            vec -= torch.mv(V[:vend].t(),c) # Subtract the projection on each vector
+            # # reorthogonalize because dividing by the norm can make it numerically non-orthogonal
+            # # projection = V[:vend] @ vec
+            # # vec -= projection @ V[:vend]
+            # for j in range(vend):
+            #     vec -= torch.dot(V[j], vec) * V[j]
             vecnorm = torch.norm(vec)
 
             if vecnorm > tol:
