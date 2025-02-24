@@ -31,7 +31,12 @@ def read_xyz(files, sort = True):
             else:
                 coords.append([element_dict[lines[i].split()[0]], float(lines[i].split()[1]), float(lines[i].split()[2]), float(lines[i].split()[3])])
         COORDINATES.append(coords)
-    COORDINATES = np.array(COORDINATES)
+
+    max_len = max(len(coord) for coord in COORDINATES)
+    # Pad rows with zeros to make them uniform
+    COORDINATES = np.array([ sublist + [[0,0,0,0]] * (max_len - len(sublist)) for sublist in COORDINATES ])
+    # COORDINATES = np.array(COORDINATES)
+
     if sort: COORDINATES = np.array([x[(-1*x[ :, 0]).argsort()] for x in COORDINATES])
 
     SPECIES =COORDINATES[:,:,0].astype(int)

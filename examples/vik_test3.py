@@ -13,17 +13,6 @@ if torch.cuda.is_available():
 else:
     device = torch.device('cpu')
 
-# species, coordinates = read_xyz(['benzene_methane.xyz', 'benzene_methane.xyz', 'benzene_methane.xyz'])
-# species = torch.as_tensor(species,dtype=torch.int64, device=device)[:]
-# coordinates = torch.tensor(coordinates, device=device)[:]
-# species[1,12:] = 0
-# species[1,6] = 1
-# coordinates[1,12:] = 0.0
-# species[2,:] = 0
-# species[2,:5] = torch.tensor([6,1,1,1,1])
-# coordinates[2,:5] = coordinates[2,12:]
-# coordinates[2,5:] = 0.0
-
 species, coordinates = read_xyz([os.path.join(os.path.dirname(__file__),'benzene.xyz')])
 species = torch.as_tensor(species,dtype=torch.int64, device=device)[:]
 coordinates = torch.tensor(coordinates, device=device)[:]
@@ -69,5 +58,4 @@ print(' Total Energy (eV):\n', molecules.Etot)
 print('\n Electronic Energy (eV): ', molecules.Eelec)
 print('\n Nuclear Energy (eV):\n', molecules.Enuc)
 print('\n Heat of Formation (kcal/mol):\n', 23.0609*molecules.Hf)
-# print(f'Interaction energy (kcal/mol) = {23.0609*(molecules.Etot[0]-molecules.Etot[1]-molecules.Etot[2])}')
 # print('\n Orbital energies (eV):\n', molecules.e_mo)
