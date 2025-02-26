@@ -643,7 +643,7 @@ class Energy(torch.nn.Module):
             if self.method != 'AM1':
                 raise ValueError('Dispersion correction has been implement only for AM1 method (AM1-FS1). We cannot do dispersion correction for other methods')
             print("Adding in dispersion corrected AM1-FS1 to Electronic energy")
-            Eelec += dispersion_am1_fs1(molecule)
+            Eelec += dispersion_am1_fs1(molecule,P)
 
         if all_terms:
             Etot, Enuc = total_energy(molecule.nmol, molecule.pair_molid,EnucAB, Eelec)
