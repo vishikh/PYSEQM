@@ -78,8 +78,8 @@ def rcis_batch(mol, w, e_mo, nroots, root_tol):
         max_iter = 100 # 5*maxSubspacesize//nroots # Heuristic: allow one or two subspace collapse. TODO: User-defined
         vector_tol = root_tol*0.02 # Vectors whose norm is smaller than this will be discarded
         iter = 0
-        vstart = torch.zeros(nmol,dtype=torch.int,device=device)
-        vend = torch.full((nmol,),nstart,dtype=torch.int,device=device)
+        vstart = torch.zeros(nmol,dtype=torch.long,device=device)
+        vend = torch.full((nmol,),nstart,dtype=torch.long,device=device)
         done = torch.zeros(nmol,dtype=torch.bool,device=device)
 
         # TODO: Test if orthogonal or nonorthogonal version is more efficient
@@ -96,51 +96,40 @@ def rcis_batch(mol, w, e_mo, nroots, root_tol):
     while iter <= max_iter: # Davidson loop
 
         with profiler.record_function("make vectors V_batched"):
-            max_v = torch.max(vend-vstart).item()
-            V_batched = torch.zeros(nmol,max_v,nov,dtype=dtype,device=device)
-            for i in range(nmol):
-                if not done[i]:
-                    V_batched[i,: (vend[i]-vstart[i]),:] = V[i,vstart[i]:vend[i],:]
+            delta = vend - vstart 
+            max_v = delta.max().item()
+            # Relative indices 0,...,max_v-1, broadcasted over molecules.
+            rel_idx = torch.arange(max_v, device=device).unsqueeze(0)  # (1, max_v)
+            # Compute absolute indices per molecule:
+            abs_idx = rel_idx + vstart.unsqueeze(1)  # (nmol, max_v)
+            # Create a mask for valid positions:
+            mask = rel_idx < delta.unsqueeze(1)  # (nmol, max_v)
+
+            # Now gather from V:
+            # First, create a batch index matrix:
+            batch_idx = torch.arange(nmol, device=device).unsqueeze(1).expand(-1, max_v)  # (nmol, max_v)
+
+            # Initialize V_batched:
+            V_batched = torch.zeros(nmol, max_v, nov, dtype=dtype, device=device)
+            V_batched[mask] = V[batch_idx[mask], abs_idx[mask], :]
 
         # TODO: Think about how HV is going to be built
         HV_batch = matrix_vector_product_batched(mol,V_batched, w, ea_ei, Cocc, Cvirt)
-
         with profiler.record_function("copy to HV"):
-            for i in range(nmol):
-                if not done[i]:
-                    HV[i, vstart[i]:vend[i]] = HV_batch[i, :(vend[i]-vstart[i])]
+            HV[batch_idx[mask], abs_idx[mask], :] = HV_batch[mask]
 
         # Make H by multiplying V.T * HV
-        # Option 1: direct multiplication
-
-        with profiler.record_function("find vend_max"):
-            vend_max = torch.max(vend).item()
         with profiler.record_function("H = VT*HV"):
+            vend_max = torch.max(vend).item()
             H = torch.einsum('bnia,bria->bnr',V[:,:vend_max].view(nmol,vend_max,nocc,nvirt),HV[:,:vend_max].view(nmol,vend_max,nocc,nvirt))
 
-        # Option 2: avoid redundant multipication by only forming the new blocks of H coming from the guess vectors V[vstart:vend]
-        # H = torch.empty(vend,vend,device=device,dtype=dtype)
-        # if vstart == 0:
-        #     H[0:vend,0:vend] = torch.einsum('nia,ria->nr',V[:vend,:].view(vend,nocc,nvirt),HV[:vend,:].view(vend,nocc,nvirt))
-        # else:
-        #     H[:vstart,:vstart] = Hold
-        #     H[vstart:vend,vstart:vend] = torch.einsum('nia,ria->nr',V[vstart:vend,:].view(vend-vstart,nocc,nvirt),HV[vstart:vend,:].view(vend-vstart,nocc,nvirt))
-        #     H[vstart:vend,:vstart] = torch.einsum('nia,ria->nr',V[vstart:vend,:].view(vend-vstart,nocc,nvirt),HV[0:vstart,:].view(vstart,nocc,nvirt))
-        #     H[:vstart,vstart:vend] = H[vstart:vend,:vstart].T
-        # Hold = H[:vend,:vend]
+        iter = iter + 1
 
-        # TODO: Check if Option 2 is necessary or go with Option 1 (much more simple and readable)
-        # Option 2 builds H block-by-block and avoids redundant multiplications
-
-        
-        with profiler.record_function("increase loop"):
-            iter = iter + 1
-
-            # Diagonalize the subspace hamiltonian
-            zero_pad = vend_max - vend
-
+        # Diagonalize the subspace hamiltonian
+        zero_pad = vend_max - vend
         with profiler.record_function("Diagonalize H"):
             e_vec_n =  get_subspace_eig_batched(H,nroots,zero_pad,e_val_n,done,nonorthogonal)
+
 
         with profiler.record_function("Make residual"):
             amplitudes = torch.einsum('bvr,bvo->bro',e_vec_n,V[:,:vend_max,:])
@@ -148,60 +137,73 @@ def rcis_batch(mol, w, e_mo, nroots, root_tol):
 
             resid_norm = torch.norm(residual,dim=2)
             roots_not_converged = resid_norm > root_tol
+        with profiler.record_function("collapse"):
+            collapse_mask = (~done) & ((roots_not_converged.sum(dim=1) + vend > maxSubspacesize))
+            # do collapse if any need to be collapsed
+            if collapse_mask.sum() > 0:
+                V[collapse_mask] = 0
+                V[collapse_mask,:nroots,:] = amplitudes[collapse_mask]
+                vstart[collapse_mask] = 0
+                vend[collapse_mask] = nroots
 
-        with profiler.record_function("test root"):
-            for i in range(nmol):
-                if done[i]:
-                    continue
-                
-                n_not_converged = roots_not_converged[i].sum()
+        with profiler.record_function("make newsubspace"):
+            orthogonalize_mask = (~done) & (~collapse_mask)
+            mols_to_ortho = torch.nonzero(orthogonalize_mask).squeeze(1)
 
-                if n_not_converged > 0 and n_not_converged + vend[i] > maxSubspacesize:
-                    #  collapse the subspace
-                    # print(f"Maximum subspace size reached for molecule {i+1}, increase the subspace size. Collapsing subspace")
-                    V[i,:] = 0
-                    V[i,:nroots,:] = amplitudes[i]
-                    # HV[:nroots,:] = torch.einsum('vr,vo->ro',e_vec_n, HV[:vend,:])
-                    vstart[i] = 0
-                    vend[i] = nroots
-                    if iter > max_iter:
-                        warnings.warn(f"Maximum iterations reached but roots have not converged for molecule {i+1}")
-                    continue
+            # Count the number of valid (nonzero) residues per molecule.
+            valid_counts = roots_not_converged.sum(dim=1)  # shape (nmol,)
+            max_valid = int(valid_counts.max().item())     # maximum valid entries over all molecules
 
-                newsubspace = residual[i,roots_not_converged[i],:]/(e_val_n[i,roots_not_converged[i]].unsqueeze(1) - approxH[i].unsqueeze(0))
+            # Allocate output tensor with shape (nmol, max_valid, nov)
+            newsubspace = torch.zeros(nmol, max_valid, nov, dtype=dtype, device=device)
 
-                vstart[i] = vend[i]
-                if nonorthogonal:
-                    raise NotImplementedError("Non-orthogonal davidson not yet implemented")
-                    newsubspace_norm = torch.norm(newsubspace,dim=1)
-                    nonzero_newsubspace = newsubspace_norm > vector_tol
-                    vend = vstart + nonzero_newsubspace.sum()
-                    V[vstart:vend] = newsubspace[nonzero_newsubspace]/newsubspace_norm[nonzero_newsubspace].unsqueeze(1)
+            # Create a batch index for each molecule (shape: (nmol, nroots)).
+            batch_idx = torch.arange(nmol, device=device).unsqueeze(1).expand(nmol, nroots)
 
-                else:
+            # Compute a cumulative sum over the valid entries along each molecule's roots.
+            # This will assign an increasing index (starting from 0) for each valid entry.
+            # For example, if a molecule has roots_not_converged: [False, True, True, False, True],
+            # torch.cumsum gives [0, 1, 2, 2, 3] and subtracting 1 yields [-1, 0, 1, 1, 2].
+            # When we mask with roots_not_converged, the indices become [0, 1, 2].
+            cumsum_idx = torch.cumsum(roots_not_converged.to(torch.int64), dim=1) - 1  # shape (nmol, nroots)
 
-                    with profiler.record_function("Orthogonalize subspace"):
-                        vend[i] = orthogonalize_to_current_subspace(V[i], newsubspace, vend[i], vector_tol)
+            # Scatter the valid quotient entries into newsubspace_out:
+            # For each valid entry, use its batch index (from batch_idx) and its "local" index (from cumsum_idx)
+            newsubspace[batch_idx[roots_not_converged], cumsum_idx[roots_not_converged], :] = residual[roots_not_converged]/(e_val_n.unsqueeze(2) - approxH.unsqueeze(1))[roots_not_converged]
 
-                roots_left = vend[i] - vstart[i]
-                if roots_left==0:
-                    done[i] = True
-                    amplitude_store[i] = amplitudes[i]
+            done_this_loop  = (~done) & (~collapse_mask) & (~orthogonalize_mask)
 
-            # print(f"Iteration {iter:2}: Found {nroots-roots_left}/{nroots} states, Total Error: {torch.sum(resid_norm[i]):.4e}")
+        with profiler.record_function("orthogonalize"):
+            if mols_to_ortho.numel() > 0:
+                vend_subset = vend[mols_to_ortho]  # shape (B,)
+                newsubspace = newsubspace[mols_to_ortho]  # shape (B, k, nov)
+                vstart[mols_to_ortho] = vend[mols_to_ortho]
 
-        
+                # Batched orthogonalization
+                # TODO: directly assign to vend
+                vend_subset = orthogonalize_to_current_subspace_batched(
+                    V, newsubspace, vend_subset, vector_tol, mols_to_ortho)
+                done[mols_to_ortho] = (vend[mols_to_ortho] == vend_subset)
+                done_this_loop[mols_to_ortho] = done[mols_to_ortho] 
+                vend[mols_to_ortho] = vend_subset
+
+            del newsubspace
+
+            amplitude_store[done_this_loop] = amplitudes[done_this_loop]
+
+
         with profiler.record_function("check all"):
             if torch.all(done):
                 break
             if iter > max_iter:
                 warnings.warn("Maximum iterations reached but roots have not converged")
 
-    print("")
+    print("\nCIS excited states:")
     for j in range(nmol):
-        print(f"Molecule {j}\n")
+        print(f"\nMolecule {j}")
         for i, energy in enumerate(e_val_n[j], start=1):
-            print(f"  State {i}: {energy:.15f} eV")
+            print(f"State {i:3d}: {energy:.15f} eV")
+    print("")
 
     return e_val_n, amplitude_store
 
@@ -436,13 +438,48 @@ def makeA_pi_symm_batch(mol,P0,w):
 
         return F
 
+def orthogonalize_to_current_subspace_batched(V, newsubspace, vend, tol, mols_to_ortho):
+    _, k, _ = newsubspace.shape
+    for j in range(k):
+        v_max = int(vend.max().item())
+        # Candidate vector for all molecules (B, nov)
+        vec = newsubspace[:, j, :]
+        
+        # Compute projection coefficients for each molecule: dot product of vec with each valid vector
+        coeff = torch.sum(V[mols_to_ortho,:v_max,:] * vec.unsqueeze(1), dim=2)  # shape (B, v_max)
+        # Compute the projection (sum over valid vectors for each molecule)
+        proj = torch.sum(coeff.unsqueeze(2) * V[mols_to_ortho,:v_max,:], dim=1)  # shape (B, nov)
+        
+        # Subtract the projection to obtain the orthogonal component
+        vec -= proj  # shape (B, nov)
+        norms = torch.norm(vec, dim=1)  # shape (B,)
+        
+        # Determine for which molecules the candidate is acceptable (norm above tolerance)
+        keep = norms > tol
+        if keep.any():
+            coeff = torch.sum(V[mols_to_ortho,:v_max,:] * vec.unsqueeze(1), dim=2)  # shape (B, v_max)
+            proj = torch.sum(coeff.unsqueeze(2) * V[mols_to_ortho,:v_max,:], dim=1)  # shape (B, nov)
+            vec -= proj  # shape (B, nov)
+            norms = torch.norm(vec, dim=1)  # shape (B,)
+            # Determine for which molecules the candidate is acceptable (norm above tolerance)
+            keep = norms > tol
+
+            # Normalize the accepted new vectors
+            # For each molecule that accepted this new vector, add it to its subspace.
+            # We use advanced indexing: the subspace for molecule i is updated at row vend[i]
+            indices = torch.nonzero(keep).squeeze(1)
+            V[mols_to_ortho[keep], vend[indices], :] = vec[keep] / (norms[keep].unsqueeze(1))
+            vend[indices] = vend[indices] + 1
+
+    return vend
+
 
 def orthogonalize_to_current_subspace(V, newsubspace, vend, tol):
     """Orthogonalizes the vectors in the newsubspace against the original subspace 
        with Gram-Schmidt orthogonalization. We cannot use Modified-Gram-Schmidt because 
        we want leave the original subspace vectors untouched
 
-    :V: Original subspace vectors (with pre-allocated memory for new vectors)
+:V: Original subspace vectors (with pre-allocated memory for new vectors)
     :newsubspace: vectors that have to be orthonormalized
     :vend: original subspace size
     :tol: the tolerance for the norm of new vectors below which the vector will be discarded
