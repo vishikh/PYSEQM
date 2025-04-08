@@ -6,7 +6,6 @@ from .constants import ev
 import sys
 import numpy
 
-import scipy.special
 from .parameters import  PWCCT
 from .RotationMatrixD import *
 import time
