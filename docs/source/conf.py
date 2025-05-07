@@ -19,7 +19,7 @@ extensions = [
     'sphinx.ext.napoleon',       # Support for Google/NumPy docstring formats
     'sphinx.ext.viewcode',       # Add links to source code
     'sphinx.ext.autosummary',    # Generate summary tables
-    'sphinx_copybutton',
+    # 'sphinx_copybutton',
 ]
 
 autosummary_generate = True  # Automatically create summary tables
